@@ -8,11 +8,11 @@ investigates private evidence, implements the proposal, and asks for clarificati
 when local conditions affect the design. A Policy Guard screens every outgoing
 local message. Model weights and the Worker's tools and permissions do not evolve.
 
-This repository implements the core method in the final paper, including both
-interaction loops and the online, offline, and frozen schedules. It does **not**
-include benchmark adapters, datasets, experimental records, or reproduced scores.
-See [paper alignment](docs/paper-alignment.md) for the requirement-by-requirement
-mapping and the conventions needed where the paper leaves details open.
+This repository accompanies the EvoBridge paper and provides the core runtime,
+model interfaces, and online, offline, and frozen execution schedules.
+Benchmark integrations, datasets, baseline implementations, and experimental
+results are outside the scope of this release. See the
+[method description](docs/method.md) and [integration guide](docs/integration.md).
 
 ## Quick start
 
@@ -26,11 +26,10 @@ python -m unittest discover -s tests -v
 evobridge demo --workdir runtime/demo
 ```
 
-The demo uses deterministic scripted roles and synthetic examples, makes no API
-calls, and demonstrates execution → sealed outcome → inquiry → clarification →
-checked publication → subsequent execution. Its outputs are **not benchmark
-results or evidence of model improvement**. Running the same completed demo again
-returns saved results without rerunning primary tasks or evolution rounds.
+The synthetic demo illustrates the interaction protocol with deterministic roles:
+task execution, outcome recording, inquiry, clarification, and checked
+publication. It runs without model endpoints and does not measure model
+performance. Repeated invocations return the recorded results.
 
 ## Method
 
@@ -67,8 +66,8 @@ programs on the host.
 
 ## Model-backed offline evolution
 
-The HTTP adapter supports a configured **OpenAI-compatible Chat Completions**
-endpoint. It does not read desktop login files or download model weights.
+The HTTP adapter connects to a configured OpenAI-compatible Chat Completions
+endpoint using environment-based credentials.
 
 ```bash
 evobridge init --directory runtime/initial-harness
@@ -130,9 +129,8 @@ worker = ModelWorker(local_client, tools=authorized_task_tools)
 results = Runner(engine, worker).online([Task("task-001", "Your task instruction")])
 ```
 
-`ModelWorker` returns an answer and tool observations, **not an invented success
-score**. An application adapter can evaluate that result and attach authorized
-feedback before returning `Experience` to the runner.
+`ModelWorker` returns an answer and tool observations. Application adapters
+provide evaluation results and authorized feedback in the returned `Experience`.
 
 - `Runner.online(...)`: fixed-order, pre-update primary execution.
 - `Runner.online(..., reset_every=10)`: reset harness and accessible history
@@ -156,11 +154,12 @@ their paths to `.gitignore`. State files use restrictive permissions, and
 snapshots are checked by content hash. Atomic claims prevent duplicate starts;
 publication checks that the current snapshot is still the candidate's base.
 
-The regex guard implements the paper's stated policy; it is **not a general
-privacy guarantee**. Unmatched content passes unchanged. Local model endpoints
-must be trusted for private data. Host-supplied tools/checks are trusted code and
-must enforce their own environment isolation. Keep credentials in environment
-variables and private logs out of the public repository.
+The rule-based guard blocks messages matching configured prohibited patterns
+and forwards unmatched messages unchanged. Its coverage depends on the sharing
+policy and does not provide a general privacy guarantee. Local model endpoints
+must be trusted for private data; application tools and checks must enforce
+their environment isolation. Store credentials in environment variables and
+keep private run records outside the source release.
 
 ## Layout
 
@@ -174,4 +173,11 @@ variables and private logs out of the public repository.
 | `tests/` | Local contract, isolation, concurrency, and mock-provider tests |
 | `docs/` | Paper mapping and integration details |
 
-No paid model call or benchmark campaign is required to run the test suite.
+The test suite runs locally with deterministic fixtures and mocked model transports.
+
+## Source archive
+
+From a Git checkout, run `python scripts/export_source.py` to create
+`dist/evobridge-source.zip`. The archive contains the tracked source files with
+normalized ZIP metadata and excludes Git history, CI configuration, build
+outputs, and run records.

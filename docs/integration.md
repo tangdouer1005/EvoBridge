@@ -42,8 +42,8 @@ the final candidate after `READY`. Each check receives a detached copy preservin
 the original base and diff. Results are tied to the actual candidate content
 hash. A check that modifies its copy fails without changing the working candidate. The Local
 Improver must also provide an artifact review. Review is an agent judgment, not
-proof of correctness. No check may silently call the official task evaluator or
-use held-out feedback to select an update.
+proof of correctness. Adoption checks exclude held-out evaluation feedback and
+official task-score comparisons.
 
 The artifact API supports additions, edits, and deletion of operation files.
 `memory.md` and `CONTEXT.md` remain present (they may be empty). Symlinks,
@@ -89,8 +89,7 @@ uses UTF-8 byte length plus framing overhead as a conservative estimate, not an
 exact tokenizer. Server-reported usage remains separate from estimates.
 
 Compaction removes older conversational tool exchanges with an explicit omission
-notice. It does not invent summaries or new evidence. Essential task/phase data
-is retained. If required context cannot fit alongside the output reservation,
+notice, retaining essential task and phase data without generating summaries. If required context cannot fit alongside the output reservation,
 the request fails before sending. This compaction policy is an implementation
 choice: the paper specifies the threshold, not the algorithm. Full guarded cloud
 transcripts must fit; they are not truncated to make a new request.
@@ -105,7 +104,7 @@ Usage receipts distinguish attempted transport calls from local preflight
 failures. Missing token counts are `None`, never zero. Cached-input and reasoning
 output counts, when supplied by the server, are subsets of the reported input
 and output totals and must not be added again. There are no automatic request
-retries. HTTP/model failures do not imply free calls. The offline CLI saves usage
+retries. Failed requests may incur provider charges. The offline CLI saves usage
 receipts to the private store when the invocation exits normally or raises a
 caught exception; abrupt process termination can leave usage unavailable.
 

@@ -1,4 +1,4 @@
-"""Independent checks of the final paper's externally visible contracts."""
+"""Tests of the method and scheduling contracts described in the paper."""
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, asdict

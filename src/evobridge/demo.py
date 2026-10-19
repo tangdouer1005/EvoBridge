@@ -1,4 +1,4 @@
-"""Deterministic plumbing demonstration, not model or benchmark evidence."""
+"""Synthetic demonstration of the two-loop interaction protocol."""
 from __future__ import annotations
 
 from .config import RunConfig
@@ -64,7 +64,7 @@ def run_demo(workdir) -> dict:
         Task("demo-2", "Apply the learned convention to the next synthetic task.")])
     frozen = evaluate_frozen(DemoWorker(), [Task("heldout", "Read the frozen synthetic harness.")],
                              store.current(), store=store, evaluation_id="demo-frozen")
-    return {"kind": "deterministic_plumbing_demo_not_benchmark_results",
+    return {"kind": "synthetic_protocol_demo",
             "primary_outcomes": [r.outcome for r in results],
             "frozen_outcome": frozen[0].outcome,
             "snapshot": store.current().id,

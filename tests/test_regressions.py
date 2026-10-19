@@ -10,7 +10,7 @@ from evobridge import (Candidate, CheckResult, CheckSuite, Engine, Experience,
 from evobridge.demo import DemoCloud, DemoLocal, DemoWorker
 
 
-class FinalReviewRegressions(unittest.TestCase):
+class RuntimeRegressionTests(unittest.TestCase):
     def test_mutating_check_cannot_smuggle_edits_into_candidate(self):
         base = Harness({"memory.md": "original", "CONTEXT.md": "Read memory.md."})
         candidate = Candidate(base)

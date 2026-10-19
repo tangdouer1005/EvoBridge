@@ -1,4 +1,4 @@
-"""One evolution round, following final-paper Algorithm 1.
+"""One evolution round, following Algorithm 1 in the paper.
 
 Only explicitly released text is passed to the cloud role. Local checks are
 publication prerequisites, never comparisons against a held-out task score.

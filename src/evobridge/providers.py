@@ -1,7 +1,7 @@
 """Small, explicit OpenAI-compatible Chat Completions transport.
 
 This module uses a configured HTTP endpoint and optional environment credential;
-it does not read Codex credentials. Requests are never retried. ``tokenizer`` is
+credentials come from the configured environment variable. Requests are never retried. ``tokenizer`` is
 an optional text-to-count callable for the deployed model. Without it, UTF-8 byte
 length plus message overhead is used as a conservative budgeting estimate, not
 an assertion of exact model tokenization or server usage.
