@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evobridge"
+version = "0.1.0"
+description = "Evolving enterprise agents from private experience through local-cloud collaboration"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+evobridge = "evobridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

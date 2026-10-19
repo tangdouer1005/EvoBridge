@@ -1,0 +1,6 @@
+{
+  "prohibited_patterns": [
+    "PRIVATE_[A-Z0-9_]+",
+    "(?i)\\b(?:api[_-]?key|access[_-]?token|password)\\s*[:=]\\s*\\S+"
+  ]
+}

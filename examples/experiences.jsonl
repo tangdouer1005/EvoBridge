@@ -1,0 +1,2 @@
+{"id":"synthetic-1","task":"Summarize a synthetic signed ledger.","outcome":{"success":false},"observations":["A refund was included as positive revenue."],"feedback":"The source ledger represents refunds as negative amounts.","metadata":{"synthetic":true}}
+{"id":"synthetic-2","task":"Explain a synthetic signed-ledger convention.","outcome":{"success":true},"observations":["The original signs were preserved."],"feedback":"Preserving source signs is applicable to signed ledgers only.","metadata":{"synthetic":true}}
