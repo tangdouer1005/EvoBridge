@@ -46,6 +46,10 @@ class Engine:
                 raise ValueError("Agent inference settings differ from the frozen configuration")
         self.identity = identity({"run": asdict(self.config), "policy": guard.identity,
                                   "resources": self.resources,
+                                  "execution": {
+                                      role: getattr(getattr(agent, "client", None), "runtime_identity",
+                                                    type(agent).__module__ + "." + type(agent).__qualname__)
+                                      for role, agent in (("local", local), ("cloud", cloud))},
                                   "checks": {k: v.behavioral for k, v in self.checks.checks.items()}})
         self.store.initialize(initial or Harness({"memory.md": "", "CONTEXT.md": ""}),
                               self.identity)

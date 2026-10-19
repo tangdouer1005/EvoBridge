@@ -1,17 +1,13 @@
-"""Model/HTTP contracts exercised with deterministic, injected transports."""
-from dataclasses import replace
-import io
+"""Native role contracts, exercised without model calls or an installed server."""
+from dataclasses import dataclass, replace
 import json
-import os
 import unittest
-from unittest.mock import patch
-from urllib.error import HTTPError
 
-from evobridge.agents import ModelCloudImprover, ModelLocalImprover, ModelWorker
+from evobridge.agents import HostTool, ModelCloudImprover, ModelLocalImprover, ModelWorker
 from evobridge.checks import CheckSuite, RegisteredCheck
 from evobridge.config import ModelSettings
 from evobridge.harness import Candidate, Harness
-from evobridge.providers import HTTPChatClient, TokenBudget, conservative_token_count
+from evobridge.providers import TokenBudget, conservative_token_count
 from evobridge.types import CheckResult, Experience, LocalContext, Message, ProtocolError, Task
 
 
@@ -23,183 +19,58 @@ CONTEXT = LocalContext(BASE, Experience("e1", "private task", "private result"),
 
 
 def tool(tool_name, **arguments):
-    return {"action": "tool", "name": tool_name, "arguments": arguments}
+    """A test script calls the registered callback, not a model JSON action."""
+    return tool_name, arguments
 
 
-def final(content):
-    return {"action": "final", "content": content}
+@dataclass
+class NativePhase:
+    final: object
+    calls: tuple = ()
 
 
-class FakeClient:
-    def __init__(self, *responses, settings=None):
+class FakeNativeRuntime:
+    """One run per native phase; scripts invoke native dispatch callbacks directly."""
+
+    def __init__(self, *phases, settings=None):
         self.settings = settings or ModelSettings.local()
-        self.responses = list(responses)
+        self.phases = list(phases)
         self.calls = []
 
-    def complete(self, messages):
-        self.calls.append([dict(m) for m in messages])
-        reply = self.responses.pop(0)
-        return reply if isinstance(reply, str) else json.dumps(reply)
+    def run(self, instructions, prompt, tools, dispatch):
+        call = {"instructions": instructions, "prompt": prompt,
+                "tools": json.loads(json.dumps(tools)), "results": []}
+        self.calls.append(call)
+
+        def invoke(name, arguments):
+            output = dispatch(name, arguments)
+            call["results"].append({"name": name, "arguments": arguments, "output": output})
+            return output
+
+        phase = self.phases.pop(0)
+        if callable(phase):
+            final = phase(invoke)
+        elif isinstance(phase, NativePhase):
+            for name, arguments in phase.calls:
+                invoke(name, arguments)
+            final = phase.final
+        else:
+            final = phase
+        return final if isinstance(final, str) else json.dumps(final)
 
 
-class ProviderTests(unittest.TestCase):
-    def test_explicit_sampling_and_environment_credential_are_sent(self):
-        calls = []
-
-        def transport(request, timeout):
-            calls.append((request, timeout))
-            return {"id": "request-1", "choices": [{"finish_reason": "stop", "message": {"content": "answer"}}],
-                    "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}}
-
-        client = HTTPChatClient("http://localhost:8000/v1", ModelSettings.local(),
-                                "TEST_EVOBRIDGE_KEY", 15, transport=transport)
-        with patch.dict(os.environ, {"TEST_EVOBRIDGE_KEY": "test-only-key"}):
-            self.assertEqual(client.complete([Message("user", "hello")]), "answer")
-        request, timeout = calls[0]
-        self.assertEqual(request.full_url, "http://localhost:8000/v1/chat/completions")
-        self.assertEqual(request.get_header("Authorization"), "Bearer test-only-key")
-        self.assertEqual(timeout, 15)
-        body = json.loads(request.data)
-        self.assertEqual(body["model"], "Qwen3.5-9B")
-        self.assertEqual(body["temperature"], .6)
-        self.assertEqual(body["top_p"], .95)
-        self.assertEqual(body["top_k"], 20)
-        self.assertEqual(body["min_p"], 0)
-        self.assertEqual(body["presence_penalty"], 0)
-        self.assertEqual(body["repetition_penalty"], 1)
-        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
-        self.assertEqual(body["max_completion_tokens"], 32768)
-        receipt = client.usage_receipts[0]
-        self.assertTrue(receipt.success)
-        self.assertTrue(receipt.attempted)
-        self.assertGreaterEqual(receipt.elapsed_seconds, 0)
-        self.assertEqual((receipt.prompt_tokens, receipt.completion_tokens, receipt.total_tokens), (12, 3, 15))
-        self.assertEqual(receipt.request_id, "request-1")
-
-    def test_cloud_effort_and_missing_usage_are_explicit(self):
-        bodies = []
-
-        def transport(request, timeout):
-            bodies.append(json.loads(request.data))
-            return json.dumps({"choices": [{"message": {"content": "cloud answer"}}]}).encode()
-
-        client = HTTPChatClient("https://example.invalid/v1/chat/completions",
-                                ModelSettings("cloud", reasoning_effort="medium"), transport=transport)
-        client.complete([{"role": "user", "content": "guarded summary"}])
-        self.assertEqual(bodies[0]["reasoning_effort"], "medium")
-        self.assertNotIn("chat_template_kwargs", bodies[0])
-        self.assertIsNone(client.usage_receipts[0].prompt_tokens)
-        self.assertIsNone(client.usage_receipts[0].total_tokens)
-
-    def test_response_error_preserves_known_usage_and_never_retries(self):
-        calls = []
-
-        def transport(request, timeout):
-            calls.append(request)
-            return {"choices": [{"finish_reason": "length", "message": {"content": "partial"}}],
-                    "usage": {"prompt_tokens": 40, "completion_tokens": 20}}
-
-        client = HTTPChatClient("https://example.invalid/v1", ModelSettings("model"), transport=transport)
-        with self.assertRaises(ProtocolError):
-            client.complete([Message("user", "request")])
-        self.assertEqual(len(calls), 1)
-        receipt = client.usage_receipts[0]
-        self.assertFalse(receipt.success)
-        self.assertEqual(receipt.prompt_tokens, 40)
-        self.assertEqual(receipt.completion_tokens, 20)
-        self.assertIsNone(receipt.total_tokens)
-
-    def test_http_failure_retains_receipt_without_replaying(self):
-        calls = []
-
-        def transport(request, timeout):
-            calls.append(request)
-            raise HTTPError(request.full_url, 429, "throttled", {},
-                            io.BytesIO(b'{"usage":{"prompt_tokens":7},"error":"throttled"}'))
-
-        client = HTTPChatClient("https://example.invalid/v1", ModelSettings("model"), transport=transport)
-        with self.assertRaises(HTTPError):
-            client.complete([Message("user", "request")])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(client.usage_receipts[0].prompt_tokens, 7)
-        self.assertEqual(client.usage_receipts[0].error, "HTTPError")
-
-    def test_oversized_mandatory_input_fails_before_transport(self):
-        calls = []
-        settings = ModelSettings("model", context_tokens=500, compact_at=400, max_output_tokens=100)
-        client = HTTPChatClient("http://localhost/v1", settings,
-                                transport=lambda *args: calls.append(args))
-        with self.assertRaises(ProtocolError):
-            client.complete([Message("system", "S" * 600), Message("user", "latest")])
-        self.assertEqual(calls, [])
-        self.assertFalse(client.usage_receipts[0].success)
-        self.assertFalse(client.usage_receipts[0].attempted)
-
-    def test_missing_credential_is_a_local_rejection_not_an_http_attempt(self):
-        calls = []
-        client = HTTPChatClient("https://example.invalid", ModelSettings("model"),
-                                "TEST_EVOBRIDGE_ABSENT", transport=lambda *args: calls.append(args))
-        with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
-            client.complete([Message("user", "request")])
-        self.assertEqual(calls, [])
-        self.assertFalse(client.usage_receipts[0].attempted)
-        self.assertIsNone(client.usage_receipts[0].prompt_tokens)
-
-    def test_cached_and_reasoning_usage_are_subsets_not_extra_total_tokens(self):
-        def transport(request, timeout):
-            return {"choices": [{"message": {"content": "answer"}}], "usage": {
-                "prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140,
-                "prompt_tokens_details": {"cached_tokens": 80},
-                "completion_tokens_details": {"reasoning_tokens": 30}}}
-
-        client = HTTPChatClient("https://example.invalid", ModelSettings("model"), transport=transport)
-        client.complete([Message("user", "request")])
-        receipt = client.usage_receipts[0]
-        self.assertEqual(receipt.prompt_cached_tokens, 80)
-        self.assertEqual(receipt.completion_reasoning_tokens, 30)
-        self.assertEqual(receipt.total_tokens, 140)
-
-    def test_transport_failure_receipt_does_not_invent_token_counts(self):
-        def transport(request, timeout):
-            raise TimeoutError("private provider text")
-
-        client = HTTPChatClient("https://example.invalid", ModelSettings("model"), transport=transport)
-        with self.assertRaises(TimeoutError):
-            client.complete([Message("user", "request")])
-        receipt = client.usage_receipts[0]
-        self.assertTrue(receipt.attempted)
-        self.assertEqual(receipt.error, "TimeoutError")
-        self.assertIsNone(receipt.prompt_tokens)
-        self.assertIsNone(receipt.completion_tokens)
+def result(runtime, index=0, phase=-1):
+    return json.loads(runtime.calls[phase]["results"][index]["output"])["result"]
 
 
-class BudgetTests(unittest.TestCase):
-    def test_compaction_preserves_both_system_protocols_and_latest_input(self):
-        settings = ModelSettings("model", context_tokens=1200, compact_at=800, max_output_tokens=200)
-        budget = TokenBudget(settings)
-        original = [{"role": "system", "content": "Trust boundary"},
-                    {"role": "system", "content": "Current phase protocol"},
-                    {"role": "user", "content": "Protected task and phase payload"},
-                    {"role": "user", "content": "old history " * 100},
-                    {"role": "assistant", "content": "old tool request"},
-                    {"role": "user", "content": "latest tool response"}]
-        fitted, omitted = budget.fit(original)
-        self.assertGreater(omitted, 0)
-        self.assertEqual(fitted[:2], original[:2])
-        self.assertEqual(fitted[2], original[2])
-        self.assertEqual(fitted[-1], original[-1])
-        self.assertIn("omitted", json.dumps(fitted))
-        self.assertLessEqual(budget.count_messages(fitted), 800)
-        self.assertEqual(len(original), 6)
-        refitted, _ = budget.fit(fitted + [{"role": "assistant", "content": "old " * 250},
-                                          {"role": "user", "content": "newest evidence"}])
-        self.assertEqual(refitted[2], original[2])
-        self.assertEqual(refitted[-1]["content"], "newest evidence")
+def schemas(runtime, phase=-1):
+    return {item["name"]: item["inputSchema"] for item in runtime.calls[phase]["tools"]}
 
+
+class ToolBudgetTests(unittest.TestCase):
     def test_utf8_tool_truncation_keeps_valid_json_and_announces_loss(self):
         settings = replace(ModelSettings.local(), tool_output_tokens=256)
-        budget = TokenBudget(settings)
-        encoded = budget.tool_result("read", "秘密\\\"\n" * 1000)
+        encoded = TokenBudget(settings).tool_result("lookup", "秘密\\\"\n" * 1000)
         decoded = json.loads(encoded)
         self.assertTrue(decoded["truncated"])
         self.assertLessEqual(conservative_token_count(encoded), 256)
@@ -215,23 +86,39 @@ class BudgetTests(unittest.TestCase):
         budget = TokenBudget(ModelSettings.local(), counter)
         self.assertEqual(budget.count("中文"), 2)
         self.assertEqual(seen, ["中文"])
-        self.assertEqual(budget.counter_name, "injected_tokenizer")
         with self.assertRaises(ValueError):
             TokenBudget(ModelSettings.local(), lambda text: True).count("text")
 
 
 class LocalAgentTests(unittest.TestCase):
-    def test_private_tools_support_preparation_and_persist_into_inquiry(self):
-        client = FakeClient(tool("read", source="history", path="past"),
-                            tool("read", source="resource", path="manual"),
-                            final("focused public summary"),
-                            tool("read", source="harness", path="memory.md"), final("targeted answer"))
-        local = ModelLocalImprover(client)
+    def test_native_tools_load_private_evidence_and_carry_only_explicit_phase_results(self):
+        runtime = FakeNativeRuntime(
+            NativePhase({"content": "focused public summary"}, (
+                tool("read", source="history", path="past"), tool("read", source="resource", path="manual"))),
+            NativePhase({"content": "targeted answer"}, (tool("read", source="harness", path="memory.md"),)))
+        local = ModelLocalImprover(runtime)
         self.assertEqual(local.prepare(CONTEXT), "focused public summary")
         self.assertEqual(local.investigate("Which fact is missing?", CONTEXT), "targeted answer")
-        last = json.dumps(client.calls[-1])
-        for expected in ("earlier private task", "private resource contents", "focused public summary", "Known facts"):
-            self.assertIn(expected, last)
+        self.assertEqual(len(runtime.calls), 2)
+        self.assertIn("earlier private task", result(runtime, phase=0)["content"])
+        self.assertEqual(result(runtime, index=1, phase=0)["content"], "private resource contents")
+        self.assertIn("focused public summary", runtime.calls[1]["prompt"])
+        self.assertNotIn("earlier private task", runtime.calls[1]["prompt"])
+        self.assertNotIn("private resource contents", runtime.calls[1]["prompt"])
+        self.assertEqual(result(runtime)["content"], "Known facts")
+        self.assertEqual(set(schemas(runtime, 0)), {"read", "list"})
+        self.assertNotIn('"action":"tool"', runtime.calls[0]["instructions"])
+
+    def test_new_preparation_clears_previous_round_results(self):
+        runtime = FakeNativeRuntime({"content": "old round summary unique"},
+                                    {"content": "old inquiry answer unique"}, {"content": "new summary"})
+        local = ModelLocalImprover(runtime)
+        local.prepare(CONTEXT)
+        local.investigate("old round question unique", CONTEXT)
+        local.prepare(CONTEXT)
+        prompt = json.loads(runtime.calls[-1]["prompt"])
+        self.assertEqual(prompt["prior_phase_results"], [])
+        self.assertNotIn("old round", runtime.calls[-1]["prompt"])
 
     def test_actual_candidate_edits_and_registered_check_are_observed(self):
         check_calls = []
@@ -240,30 +127,33 @@ class LocalAgentTests(unittest.TestCase):
             check_calls.append(candidate)
             return CheckResult("facts", candidate.read("memory.md") == "New fact", "checked contents")
 
-        client = FakeClient(tool("write", path="memory.md", content="New fact"),
-                            tool("delete", path="skills/old/SKILL.md"),
-                            tool("check", name="facts"),
-                            tool("read", source="candidate", path="memory.md"),
-                            {"action": "final", "status": "READY", "reviewed": True,
-                             "review": "Checked the changed fact and removed the obsolete operation."})
-        local = ModelLocalImprover(client, CheckSuite({"facts": RegisteredCheck(check)}))
+        runtime = FakeNativeRuntime(NativePhase(
+            {"status": "READY", "reviewed": True, "review": "Checked changed facts and obsolete operations."}, (
+                tool("write", path="memory.md", content="New fact"),
+                tool("write", path="CONTEXT.md", content="Apply the updated fact."),
+                tool("write", path="skills/new/SKILL.md", content="Use known facts."),
+                tool("delete", path="skills/old/SKILL.md"), tool("check", name="facts"),
+                tool("read", source="candidate", path="memory.md"))))
+        local = ModelLocalImprover(runtime, CheckSuite({"facts": RegisteredCheck(check)}))
         candidate = Candidate(BASE)
-        result = local.realize(candidate, (Message("assistant", "Update the fact."),), CONTEXT, 3)
-        self.assertEqual(result.status, "READY")
-        self.assertIs(result.reviewed, True)
+        realized = local.realize(candidate, (Message("assistant", "Update the fact."),), CONTEXT, 3)
+        self.assertEqual(realized.status, "READY")
+        self.assertIs(realized.reviewed, True)
         self.assertIsNot(check_calls[0], candidate)
         self.assertEqual(check_calls[0].freeze().id, candidate.freeze().id)
         self.assertEqual(check_calls[0].changed_paths, candidate.changed_paths)
         self.assertEqual(candidate.read("memory.md"), "New fact")
         self.assertNotIn("skills/old/SKILL.md", candidate.list_files())
         self.assertEqual(BASE.files["memory.md"], "Known facts")
-        self.assertIn("checked contents", json.dumps(client.calls[-1]))
+        self.assertEqual(result(runtime, 4)["details"], "checked contents")
+        self.assertEqual(set(schemas(runtime)), {"read", "list", "check", "write", "delete"})
+        self.assertEqual(schemas(runtime)["check"]["properties"]["name"]["enum"], ["facts"])
 
-    def test_readonly_inquiry_rejects_writes_even_if_candidate_is_available(self):
+    def test_readonly_phase_neither_registers_nor_permits_mutation_tools(self):
         for method in ("prepare", "investigate"):
             with self.subTest(method=method):
-                client = FakeClient(tool("write", path="memory.md", content="unauthorized"))
-                local = ModelLocalImprover(client)
+                runtime = FakeNativeRuntime(NativePhase(None, (tool("write", path="memory.md", content="bad"),)))
+                local = ModelLocalImprover(runtime)
                 candidate = Candidate(BASE)
                 with self.assertRaises(ProtocolError):
                     if method == "prepare":
@@ -271,214 +161,255 @@ class LocalAgentTests(unittest.TestCase):
                     else:
                         local.investigate("question", CONTEXT, candidate)
                 self.assertEqual(candidate.freeze().id, BASE.id)
-                self.assertEqual(len(client.calls), 1)
+                self.assertNotIn("write", schemas(runtime))
+                self.assertNotIn("delete", schemas(runtime))
+                self.assertEqual(len(runtime.calls), 1)
+
+    def test_editable_scope_excludes_host_files_and_protects_root_documents(self):
+        for request in (tool("write", path="/tmp/private", content="x"),
+                        tool("write", path="../escape", content="x"),
+                        tool("write", path="README.md", content="x"),
+                        tool("delete", path="CONTEXT.md")):
+            with self.subTest(request=request):
+                runtime = FakeNativeRuntime(NativePhase(None, (request,)))
+                candidate = Candidate(BASE)
+                with self.assertRaises(ValueError):
+                    ModelLocalImprover(runtime).realize(candidate, (Message("user", "proposal"),), CONTEXT, 1)
+                self.assertEqual(candidate.freeze().id, BASE.id)
 
     def test_unregistered_shell_or_check_fails_closed(self):
         for request in (tool("shell", command="echo bad"), tool("check", name="unregistered")):
-            client = FakeClient(request)
+            runtime = FakeNativeRuntime(NativePhase(None, (request,)))
             with self.assertRaises(ProtocolError):
-                ModelLocalImprover(client).realize(Candidate(BASE), (Message("user", "proposal"),), CONTEXT, 1)
-            self.assertEqual(len(client.calls), 1)
+                ModelLocalImprover(runtime).realize(Candidate(BASE), (Message("user", "proposal"),), CONTEXT, 1)
+            self.assertEqual(len(runtime.calls), 1)
+            self.assertNotIn("shell", schemas(runtime))
 
-    def test_inquiry_checks_inspect_detached_copy_without_mutating_active_candidate(self):
+    def test_preparation_does_not_expose_registered_checks(self):
+        suite = CheckSuite({"inspect": RegisteredCheck(lambda _: CheckResult("inspect", True))})
+        runtime = FakeNativeRuntime(NativePhase(None, (tool("check", name="inspect"),)))
+        with self.assertRaises(ProtocolError):
+            ModelLocalImprover(runtime, suite).prepare(CONTEXT)
+        self.assertNotIn("check", schemas(runtime))
+
+    def test_inquiry_checks_cannot_mutate_active_candidate(self):
         checked = []
 
         def bad_check(candidate):
             checked.append(candidate)
-            candidate.write("memory.md", "accidental check mutation")
+            candidate.write("memory.md", "accidental mutation")
             return CheckResult("inspect", True, "looked at candidate")
 
-        client = FakeClient(tool("check", name="inspect"), final("The check rejected its own mutation."))
-        local = ModelLocalImprover(client, CheckSuite({"inspect": RegisteredCheck(bad_check)}))
+        runtime = FakeNativeRuntime(NativePhase({"content": "The check rejected its own mutation."},
+                                                (tool("check", name="inspect"),)))
+        local = ModelLocalImprover(runtime, CheckSuite({"inspect": RegisteredCheck(bad_check)}))
         active = Candidate(BASE)
         active.write("memory.md", "active work in progress")
-        local.investigate("Inspect the current draft", CONTEXT, active)
+        local.investigate("Inspect current draft", CONTEXT, active)
         self.assertIsNot(checked[0], active)
         self.assertEqual(checked[0].changed_paths, active.changed_paths)
         self.assertEqual(active.read("memory.md"), "active work in progress")
         self.assertEqual(BASE.files["memory.md"], "Known facts")
-        result = json.loads(client.calls[-1][-1]["content"])["result"]
-        self.assertFalse(result["passed"])
+        self.assertFalse(result(runtime)["passed"])
 
-    def test_inquiry_checks_without_candidate_use_a_copy_of_published_harness(self):
+    def test_inquiry_checks_without_candidate_use_published_harness_copy(self):
         seen = []
 
         def inspect(candidate):
             seen.append(candidate.read("memory.md"))
             return CheckResult("inspect", True, "inspected")
 
-        client = FakeClient(tool("check", name="inspect"), final("Inspected published facts."))
-        ModelLocalImprover(client, CheckSuite({"inspect": RegisteredCheck(inspect)})).investigate(
-            "Inspect published behavior", CONTEXT)
+        runtime = FakeNativeRuntime(NativePhase({"content": "Inspected facts."}, (tool("check", name="inspect"),)))
+        ModelLocalImprover(runtime, CheckSuite({"inspect": RegisteredCheck(inspect)})).investigate("Inspect", CONTEXT)
         self.assertEqual(seen, ["Known facts"])
+        self.assertNotIn("candidate", schemas(runtime)["read"]["properties"]["source"]["enum"])
 
-    def test_malformed_protocol_is_not_repaired_or_coerced(self):
-        responses = ['```json\n{"action":"final","content":"text"}\n```',
-                     '{"action":"final","action":"tool","content":"text"}',
-                     {"action": "final", "content": "text", "extra": 1},
-                     '["final"]', '{"action":"final","content":NaN}']
+    def test_malformed_final_protocol_is_not_repaired_or_coerced(self):
+        responses = ['```json\n{"content":"text"}\n```', '{"content":"a","content":"b"}',
+                     {"content": "text", "extra": 1}, '["final"]', '{"content":NaN}',
+                     {"action": "tool", "name": "read", "arguments": {}},
+                     {"action": "final", "content": "legacy envelope"}, {"content": ""}]
         for reply in responses:
             with self.subTest(reply=reply):
-                client = FakeClient(reply)
+                runtime = FakeNativeRuntime(reply)
                 with self.assertRaises(ProtocolError):
-                    ModelLocalImprover(client).prepare(CONTEXT)
-                self.assertEqual(len(client.calls), 1)
+                    ModelLocalImprover(runtime).prepare(CONTEXT)
+                self.assertEqual(len(runtime.calls), 1)
 
-    def test_clarification_continues_same_candidate_and_private_history(self):
-        client = FakeClient(tool("write", path="memory.md", content="intermediate"),
-                            {"action": "final", "status": "CLARIFY", "clarification": "Use the fallback?"},
-                            tool("read", source="candidate", path="memory.md"),
-                            {"action": "final", "status": "STOP", "review": "Proposal withdrawn."})
-        local = ModelLocalImprover(client)
+    def test_clarification_keeps_candidate_and_explicit_phase_result(self):
+        runtime = FakeNativeRuntime(
+            NativePhase({"status": "CLARIFY", "clarification": "Use the fallback?"},
+                        (tool("write", path="memory.md", content="intermediate"),)),
+            NativePhase({"status": "STOP", "review": "Proposal withdrawn."},
+                        (tool("read", source="candidate", path="memory.md"),)))
+        local = ModelLocalImprover(runtime)
         candidate = Candidate(BASE)
         first = local.realize(candidate, (Message("user", "proposal"),), CONTEXT, 3)
         second = local.realize(candidate, (Message("user", "proposal"), Message("assistant", "withdraw")), CONTEXT, 2)
-        self.assertEqual(first.status, "CLARIFY")
-        self.assertEqual(second.status, "STOP")
+        self.assertEqual((first.status, second.status), ("CLARIFY", "STOP"))
+        self.assertEqual(result(runtime)["content"], "intermediate")
+        self.assertIn("Use the fallback?", runtime.calls[-1]["prompt"])
         self.assertEqual(candidate.read("memory.md"), "intermediate")
-        self.assertIn("Use the fallback?", json.dumps(client.calls[-1]))
 
-    def test_model_cannot_claim_review_with_a_truthy_string(self):
-        client = FakeClient({"action": "final", "status": "READY", "reviewed": "true", "review": "review"})
-        with self.assertRaises(ProtocolError):
-            ModelLocalImprover(client).realize(Candidate(BASE), (Message("user", "proposal"),), CONTEXT, 1)
+    def test_realization_boolean_status_and_clarification_budget_are_enforced(self):
+        cases = [({"status": "READY", "reviewed": "true", "review": "review"}, 1),
+                 ({"status": "CLARIFY", "clarification": "question"}, 0),
+                 ({"status": "READY", "reviewed": True, "review": "review", "extra": 1}, 1),
+                 ({"status": "UNKNOWN", "review": "review"}, 1)]
+        for reply, remaining in cases:
+            with self.subTest(reply=reply):
+                runtime = FakeNativeRuntime(reply)
+                with self.assertRaises(ProtocolError):
+                    ModelLocalImprover(runtime).realize(Candidate(BASE), (Message("user", "proposal"),), CONTEXT, remaining)
 
-    def test_tool_loop_has_a_finite_budget(self):
-        client = FakeClient(tool("list", source="harness"), tool("list", source="harness"))
-        with self.assertRaises(ProtocolError):
-            ModelLocalImprover(client, max_tool_steps=1).prepare(CONTEXT)
-        self.assertEqual(len(client.calls), 2)
+    def test_native_runtime_owns_tool_iteration_without_custom_role_step_cap(self):
+        def native_phase(dispatch):
+            for _ in range(100):
+                dispatch("list", {"source": "harness"})
+            return {"content": "Native session completed."}
 
-    def test_long_experience_uses_bounded_overview_and_paging_can_read_its_tail(self):
-        experience = Experience("long-record", "Preserved task description", "outcome",
+        runtime = FakeNativeRuntime(native_phase)
+        ModelLocalImprover(runtime).prepare(CONTEXT)
+        self.assertEqual(len(runtime.calls), 1)
+        self.assertEqual(len(runtime.calls[0]["results"]), 100)
+
+    def test_long_experience_initial_overview_is_bounded_and_tail_remains_accessible(self):
+        experience = Experience("long", "Preserved task description", "outcome",
                                 ("prefix" * 40000, "LATE_EXPERIENCE_SENTINEL"), "feedback")
         serialized = json.dumps(experience.to_dict(), ensure_ascii=False)
         offset = serialized.index("LATE_EXPERIENCE_SENTINEL")
-        context = LocalContext(BASE, experience, (), {})
-        settings = replace(ModelSettings.local(), context_tokens=16000, compact_at=12000,
-                           max_output_tokens=2000, tool_output_tokens=512)
-        client = FakeClient(tool("read", source="experience", offset=offset, limit=100),
-                            final("Inspected the late observation."), settings=settings)
-        local = ModelLocalImprover(client)
-        local.prepare(context)
-        self.assertIn("Preserved task description", client.calls[0][2]["content"])
-        self.assertNotIn("prefix" * 100, json.dumps(client.calls[0]))
-        self.assertIn("full_record_access", json.dumps(client.calls[0]))
-        page = json.loads(client.calls[-1][-1]["content"])["result"]
+        runtime = FakeNativeRuntime(NativePhase({"content": "Inspected late observation."},
+            (tool("read", source="experience", offset=offset, limit=100),)),
+            settings=replace(ModelSettings.local(), tool_output_tokens=512))
+        ModelLocalImprover(runtime).prepare(LocalContext(BASE, experience, (), {}))
+        prompt = runtime.calls[0]["prompt"]
+        self.assertIn("Preserved task description", prompt)
+        self.assertNotIn("prefix" * 100, prompt)
+        self.assertIn("full_record_access", prompt)
+        page = result(runtime)
         self.assertIn("LATE_EXPERIENCE_SENTINEL", page["content"])
-        self.assertEqual(page["offset"], offset)
-        self.assertEqual(page["total_chars"], len(serialized))
-        self.assertEqual(page["format"], "json")
+        self.assertEqual((page["offset"], page["total_chars"], page["format"]), (offset, len(serialized), "json"))
 
-    def test_all_local_read_sources_can_reach_content_beyond_the_initial_preview(self):
+    def test_all_local_read_sources_reach_content_beyond_preview(self):
         value = "prefix" * 10000 + "LATE_CONTENT_SENTINEL"
         harness = Harness({**BASE.files, "skills/large/SKILL.md": value})
-        historical = Experience("old-record", "task", value)
+        historical = Experience("old", "task", value)
         history_json = json.dumps(historical.to_dict(), ensure_ascii=False)
         context = LocalContext(harness, CONTEXT.experience, (historical,), {"large": value})
-        sources = [("harness", "skills/large/SKILL.md", value),
-                   ("candidate", "skills/large/SKILL.md", value),
-                   ("resource", "large", value), ("history", "old-record", history_json)]
+        sources = [("harness", "skills/large/SKILL.md", value), ("candidate", "skills/large/SKILL.md", value),
+                   ("resource", "large", value), ("history", "old", history_json)]
         for source, path, complete_text in sources:
             with self.subTest(source=source):
-                offset = complete_text.index("LATE_CONTENT_SENTINEL")
-                client = FakeClient(tool("read", source=source, path=path, offset=offset, limit=100),
-                                    final("Read late evidence."),
-                                    settings=replace(ModelSettings.local(), tool_output_tokens=256))
-                ModelLocalImprover(client).investigate("Read the tail", context, Candidate(harness))
-                encoded = client.calls[-1][-1]["content"]
-                page = json.loads(encoded)["result"]
+                runtime = FakeNativeRuntime(NativePhase({"content": "Read late evidence."}, (
+                    tool("read", source=source, path=path, offset=complete_text.index("LATE_CONTENT_SENTINEL"), limit=100),)),
+                    settings=replace(ModelSettings.local(), tool_output_tokens=256))
+                ModelLocalImprover(runtime).investigate("Read tail", context, Candidate(harness))
+                page = result(runtime)
                 self.assertIn("LATE_CONTENT_SENTINEL", page["content"])
-                self.assertLessEqual(conservative_token_count(encoded), 256)
                 self.assertEqual(page["total_chars"], len(complete_text))
+                encoded = runtime.calls[0]["results"][0]["output"]
+                self.assertLessEqual(conservative_token_count(encoded), 256)
                 self.assertNotIn("truncated", json.loads(encoded))
 
-    def test_pages_shrink_to_budget_and_next_offsets_reconstruct_the_exact_source(self):
+    def test_default_pages_preserve_continuation_and_reconstruct_exact_private_content(self):
         value = ('前缀\\"\n' * 200) + "LATE_SENTINEL"
-        context = LocalContext(BASE, CONTEXT.experience, (), {"paged": value})
+        segments = []
 
-        class PagingClient(FakeClient):
-            def __init__(self):
-                super().__init__(settings=replace(ModelSettings.local(), tool_output_tokens=384))
-                self.segments = []
+        def native_phase(dispatch):
+            args = {"source": "resource", "path": "paged"}
+            while True:
+                page = json.loads(dispatch("read", args))["result"]
+                segments.append(page["content"])
+                if page["next_offset"] is None:
+                    return {"content": "Read entire private resource."}
+                args["offset"] = page["next_offset"]
 
-            def complete(self, messages):
-                self.calls.append([dict(m) for m in messages])
-                latest = json.loads(messages[-1]["content"])
-                offset = 0
-                if latest.get("tool") == "read":
-                    self.segments.append(latest["result"]["content"])
-                    offset = latest["result"]["next_offset"]
-                    if offset is None:
-                        return json.dumps(final("Read the entire private resource."))
-                return json.dumps(tool("read", source="resource", path="paged", offset=offset, limit=65536))
+        runtime = FakeNativeRuntime(native_phase, settings=replace(ModelSettings.local(), tool_output_tokens=384))
+        ModelLocalImprover(runtime).prepare(LocalContext(BASE, CONTEXT.experience, (), {"paged": value}))
+        self.assertEqual("".join(segments), value)
+        self.assertGreater(len(segments), 1)
+        for item in runtime.calls[0]["results"]:
+            self.assertLessEqual(conservative_token_count(item["output"]), 384)
+            self.assertNotIn("truncated", json.loads(item["output"]))
 
-        client = PagingClient()
-        ModelLocalImprover(client).prepare(context)
-        self.assertEqual("".join(client.segments), value)
-        self.assertGreater(len(client.segments), 1)
-        for call in client.calls[1:]:
-            envelope = call[-1]["content"]
-            self.assertLessEqual(conservative_token_count(envelope), 384)
-            self.assertNotIn("truncated", json.loads(envelope))
+    def test_private_source_lists_are_pageable_json(self):
+        resources = {f"resource-{i:03}": "private value" for i in range(100)}
+        segments = []
 
-    def test_invalid_page_parameters_fail_closed_without_additional_model_calls(self):
-        for paging in ({"offset": -1}, {"offset": True}, {"offset": "1"},
-                       {"limit": 0}, {"limit": 65537}, {"limit": False},
-                       {"limit": 1.5}, {"offset": 10000, "limit": 10}):
+        def native_phase(dispatch):
+            offset = 0
+            while offset is not None:
+                page = json.loads(dispatch("list", {"source": "resource", "offset": offset}))["result"]
+                segments.append(page["content"])
+                offset = page["next_offset"]
+            return {"content": "Listed resources."}
+
+        runtime = FakeNativeRuntime(native_phase, settings=replace(ModelSettings.local(), tool_output_tokens=256))
+        ModelLocalImprover(runtime).prepare(LocalContext(BASE, CONTEXT.experience, (), resources))
+        self.assertEqual(json.loads("".join(segments)), sorted(resources))
+
+    def test_invalid_page_parameters_fail_without_another_native_phase(self):
+        for paging in ({"offset": -1}, {"offset": True}, {"offset": "1"}, {"limit": 0}, {"limit": 65537},
+                       {"limit": False}, {"limit": 1.5}, {"offset": 10000, "limit": 10}):
             with self.subTest(paging=paging):
-                client = FakeClient(tool("read", source="harness", path="memory.md", **paging))
+                runtime = FakeNativeRuntime(NativePhase(None, (tool("read", source="harness", path="memory.md", **paging),)))
                 with self.assertRaises(ProtocolError):
-                    ModelLocalImprover(client).prepare(CONTEXT)
-                self.assertEqual(len(client.calls), 1)
+                    ModelLocalImprover(runtime).prepare(CONTEXT)
+                self.assertEqual(len(runtime.calls), 1)
 
-    def test_too_small_budget_rejects_page_instead_of_losing_continuation_metadata(self):
-        client = FakeClient(tool("read", source="harness", path="memory.md", offset=0, limit=10),
-                            settings=replace(ModelSettings.local(), tool_output_tokens=32))
+    def test_too_small_page_budget_rejects_instead_of_losing_continuation(self):
+        runtime = FakeNativeRuntime(NativePhase(None, (tool("read", source="harness", path="memory.md"),)),
+                                    settings=replace(ModelSettings.local(), tool_output_tokens=32))
         with self.assertRaises(ProtocolError):
-            ModelLocalImprover(client).prepare(CONTEXT)
-        self.assertEqual(len(client.calls), 1)
+            ModelLocalImprover(runtime).prepare(CONTEXT)
 
 
-class CloudAndWorkerTests(unittest.TestCase):
-    def test_identical_briefs_do_not_reuse_hidden_cloud_answers_between_rounds(self):
-        client = FakeClient({"action": "PROPOSE", "content": "old round unique proposal"},
-                            {"action": "RETAIN", "content": "fresh round decision"})
-        cloud = ModelCloudImprover(client)
+class CloudAgentTests(unittest.TestCase):
+    def test_identical_briefs_never_reuse_hidden_answers(self):
+        runtime = FakeNativeRuntime({"action": "PROPOSE", "content": "old round unique proposal"},
+                                    {"action": "RETAIN", "content": "fresh decision"})
+        cloud = ModelCloudImprover(runtime)
         same_brief = (Message("user", "identical summary"),)
         cloud.decide(same_brief, 3)
         cloud.decide(same_brief, 3)
-        self.assertNotIn("old round unique proposal", json.dumps(client.calls[-1]))
-        self.assertEqual(client.calls[0], client.calls[1])
+        self.assertNotIn("old round unique proposal", runtime.calls[-1]["prompt"])
+        self.assertEqual(runtime.calls[0], runtime.calls[1])
 
-    def test_cloud_uses_authoritative_transcript_once_without_duplicating_own_answer(self):
-        client = FakeClient({"action": "ASK", "content": "unique question"},
-                            {"action": "PROPOSE", "content": "proposal"})
-        cloud = ModelCloudImprover(client)
+    def test_complete_authoritative_transcript_has_no_duplication_or_compaction(self):
+        runtime = FakeNativeRuntime({"action": "ASK", "content": "unique question"},
+                                    {"action": "PROPOSE", "content": "proposal"},
+                                    settings=ModelSettings("cloud", context_tokens=1000, compact_at=800, max_output_tokens=100))
+        cloud = ModelCloudImprover(runtime)
         initial = (Message("user", "summary"),)
         cloud.decide(initial, 3)
-        supplied = initial + (Message("assistant", "unique question"), Message("user", "answer"))
+        supplied = initial + (Message("assistant", "unique question"), Message("user", "released answer " * 1000))
         cloud.decide(supplied, 2)
-        prompt = json.dumps(client.calls[-1])
+        prompt = runtime.calls[-1]["prompt"]
         self.assertEqual(prompt.count("unique question"), 1)
-        self.assertEqual(json.loads(client.calls[-1][-1]["content"])["transcript"],
-                         [{"role": m.role, "content": m.content} for m in supplied])
+        self.assertEqual(json.loads(prompt)["transcript"], [{"role": m.role, "content": m.content} for m in supplied])
+        self.assertEqual(runtime.calls[-1]["tools"], [])
 
-    def test_cloud_has_only_guarded_input_and_keeps_prior_exchange(self):
-        client = FakeClient({"action": "ASK", "content": "Which behavior failed?"},
-                            {"action": "PROPOSE", "content": "Update the memory."},
-                            {"action": "RESPOND", "content": "Use the documented fallback."})
-        cloud = ModelCloudImprover(client)
+    def test_cloud_has_only_guarded_input_and_correct_phase_actions(self):
+        runtime = FakeNativeRuntime({"action": "ASK", "content": "Which behavior failed?"},
+                                    {"action": "PROPOSE", "content": "Update memory."},
+                                    {"action": "RESPOND", "content": "Use documented fallback."})
+        cloud = ModelCloudImprover(runtime)
         initial = (Message("user", "BLOCKED"),)
         self.assertEqual(cloud.decide(initial, 3).action, "ASK")
         supplied = initial + (Message("assistant", "Which behavior failed?"), Message("user", "sanitized evidence"))
         self.assertEqual(cloud.decide(supplied, 2).action, "PROPOSE")
-        self.assertEqual(cloud.respond(supplied + (Message("user", "A clarification"),), 2).action, "RESPOND")
-        prompt = json.dumps(client.calls[-1])
+        self.assertEqual(cloud.respond(supplied + (Message("user", "clarification"),), 2).action, "RESPOND")
+        prompt = runtime.calls[-1]["prompt"]
         self.assertIn("BLOCKED", prompt)
         self.assertIn("sanitized evidence", prompt)
         self.assertNotIn("private resource contents", prompt)
         self.assertNotIn("private task", prompt)
+        self.assertEqual(runtime.calls[-1]["tools"], [])
+
+    def test_cloud_dispatch_fails_closed_even_when_runtime_attempts_tool(self):
+        runtime = FakeNativeRuntime(NativePhase(None, (tool("read", source="resource", path="manual"),)))
+        with self.assertRaises(ProtocolError):
+            ModelCloudImprover(runtime).decide((Message("user", "brief"),), 1)
 
     def test_cloud_enforces_phase_actions_fields_and_inquiry_budget(self):
         cases = [("decide", {"action": "RESPOND", "content": "answer"}, 1),
@@ -487,55 +418,108 @@ class CloudAndWorkerTests(unittest.TestCase):
                  ("decide", {"action": "PROPOSE", "content": "proposal", "private": "data"}, 1)]
         for phase, reply, budget in cases:
             with self.subTest(phase=phase, reply=reply):
-                client = FakeClient(reply)
+                runtime = FakeNativeRuntime(reply)
                 with self.assertRaises(ProtocolError):
-                    getattr(ModelCloudImprover(client), phase)((Message("user", "summary"),), budget)
-                self.assertEqual(len(client.calls), 1)
+                    getattr(ModelCloudImprover(runtime), phase)((Message("user", "summary"),), budget)
+                self.assertEqual(len(runtime.calls), 1)
 
-    def test_worker_initializes_context_and_uses_only_registered_host_tools(self):
-        def lookup(key):
-            """Look up a public fixture key using argument key."""
-            return {"value": "fixture:" + key}
 
-        client = FakeClient(tool("read_harness", path="memory.md"), tool("lookup", key="sample"), final("task answer"))
-        worker = ModelWorker(client, {"lookup": lookup})
-        result = worker.execute(Task("task1", "Answer the task"), BASE)
-        self.assertEqual(result.outcome, "task answer")
-        self.assertEqual(result.feedback, "")
-        self.assertEqual(len(result.observations), 2)
-        self.assertIn("fixture:sample", result.observations[-1])
-        self.assertIn("Follow relevant skills.", client.calls[0][-1]["content"])
+class WorkerTests(unittest.TestCase):
+    def test_worker_loads_context_and_exposes_signature_and_docstring_native_tool(self):
+        def lookup(key: str, count: int = 1):
+            """Look up an authorized fixture key."""
+            return {"value": ("fixture:" + key) * count}
+
+        runtime = FakeNativeRuntime(NativePhase({"content": "task answer"}, (
+            tool("read_harness", path="memory.md"), tool("lookup", key="sample"))))
+        worker = ModelWorker(runtime, {"lookup": lookup})
+        experience = worker.execute(Task("task1", "Answer task"), BASE)
+        self.assertEqual(experience.outcome, "task answer")
+        self.assertEqual(experience.feedback, "")
+        self.assertEqual(len(experience.observations), 2)
+        self.assertIn("fixture:sample", experience.observations[-1])
+        self.assertIn("Follow relevant skills.", runtime.calls[0]["prompt"])
         self.assertEqual(BASE.files["memory.md"], "Known facts")
+        schema = schemas(runtime)["lookup"]
+        self.assertEqual(schema["required"], ["key"])
+        self.assertEqual(schema["properties"]["key"], {"type": "string"})
+        self.assertEqual(schema["properties"]["count"], {"type": "integer", "default": 1})
+        self.assertFalse(schema["additionalProperties"])
+        self.assertIn("authorized fixture", runtime.calls[0]["tools"][-1]["description"])
+        self.assertEqual(set(schemas(runtime)), {"read_harness", "list_harness", "lookup"})
 
-    def test_worker_cannot_request_an_implicit_environment_tool(self):
-        client = FakeClient(tool("shell", command="echo unavailable"))
-        with self.assertRaises(ProtocolError):
-            ModelWorker(client).execute(Task("task1", "Run a task"), BASE)
-        self.assertEqual(len(client.calls), 1)
+    def test_explicit_host_tool_schema_is_registered(self):
+        def lookup(**arguments):
+            return arguments["item"]
 
-    def test_worker_read_harness_can_page_to_a_late_sentinel(self):
+        schema = {"type": "object", "properties": {"item": {"enum": ["yes", "no"]}}, "required": ["item"]}
+        runtime = FakeNativeRuntime(NativePhase({"content": "yes"}, (tool("choose", item="yes"),)))
+        worker = ModelWorker(runtime, {"choose": HostTool(lookup, schema, "Choose the supplied item.")})
+        worker.execute(Task("task", "Choose"), BASE)
+        self.assertEqual(schemas(runtime)["choose"], schema)
+        self.assertEqual(result(runtime), "yes")
+
+    def test_worker_cannot_call_implicit_shell_write_or_check(self):
+        for name in ("shell", "write", "check"):
+            runtime = FakeNativeRuntime(NativePhase(None, (tool(name),)))
+            with self.assertRaises(ProtocolError):
+                ModelWorker(runtime).execute(Task("task1", "Run task"), BASE)
+            self.assertNotIn(name, schemas(runtime))
+            self.assertEqual(len(runtime.calls), 1)
+
+    def test_worker_reload_context_and_start_each_task_without_prior_task_evidence(self):
+        runtime = FakeNativeRuntime(NativePhase({"content": "previous private answer"},
+                                                (tool("private"),)), {"content": "next answer"})
+        worker = ModelWorker(runtime, {"private": lambda: "previous private evidence"})
+        worker.execute(Task("first", "previous private task"), BASE)
+        updated = Harness({**BASE.files, "CONTEXT.md": "Updated task policy."})
+        second = worker.execute(Task("second", "new task"), updated)
+        self.assertEqual(second.observations, ())
+        self.assertIn("Updated task policy.", runtime.calls[1]["prompt"])
+        self.assertNotIn("previous private", runtime.calls[1]["prompt"])
+
+    def test_worker_read_harness_pages_to_tail(self):
         prefix = "large artifact prefix " * 10000
         harness = Harness({**BASE.files, "skills/large/SKILL.md": prefix + "LATE_WORKER_SENTINEL"})
-        client = FakeClient(tool("read_harness", path="skills/large/SKILL.md", offset=len(prefix), limit=100),
-                            final("Found the late artifact content."),
-                            settings=replace(ModelSettings.local(), tool_output_tokens=256))
-        experience = ModelWorker(client).execute(Task("t", "Inspect the artifact tail"), harness)
+        runtime = FakeNativeRuntime(NativePhase({"content": "Found late artifact."}, (
+            tool("read_harness", path="skills/large/SKILL.md", offset=len(prefix), limit=100),)),
+            settings=replace(ModelSettings.local(), tool_output_tokens=256))
+        experience = ModelWorker(runtime).execute(Task("t", "Inspect artifact tail"), harness)
         page = json.loads(experience.observations[0])["result"]
         self.assertEqual(page["content"], "LATE_WORKER_SENTINEL")
         self.assertIsNone(page["next_offset"])
         self.assertLessEqual(conservative_token_count(experience.observations[0]), 256)
 
-    def test_worker_compaction_retains_task_context_and_latest_tool_result(self):
-        settings = ModelSettings("model", context_tokens=4500, compact_at=3500,
-                                 max_output_tokens=500, tool_output_tokens=2200)
-        client = FakeClient(tool("large"), tool("large"), final("answer"), settings=settings)
-        worker = ModelWorker(client, {"large": lambda: "evidence" * 200})
-        worker.execute(Task("task", "protected original task"), BASE)
-        final_prompt = client.calls[-1]
-        self.assertIn("Context compaction", json.dumps(final_prompt))
-        self.assertIn("protected original task", final_prompt[2]["content"])
-        self.assertIn("Follow relevant skills.", final_prompt[2]["content"])
-        self.assertIn("evidence", final_prompt[-1]["content"])
+    def test_worker_large_host_outputs_are_bounded_in_native_results_and_observations(self):
+        runtime = FakeNativeRuntime(NativePhase({"content": "answer"}, (tool("large"),)),
+                                    settings=replace(ModelSettings.local(), tool_output_tokens=256))
+        experience = ModelWorker(runtime, {"large": lambda: "evidence" * 1000}).execute(Task("t", "task"), BASE)
+        self.assertEqual(experience.observations[0], runtime.calls[0]["results"][0]["output"])
+        self.assertTrue(json.loads(experience.observations[0])["truncated"])
+        self.assertLessEqual(conservative_token_count(experience.observations[0]), 256)
+
+    def test_worker_rejects_invalid_registered_arguments_before_callback(self):
+        invoked = []
+
+        def lookup(key):
+            invoked.append(key)
+
+        runtime = FakeNativeRuntime(NativePhase(None, (tool("lookup", wrong="bad"),)))
+        with self.assertRaises(ProtocolError):
+            ModelWorker(runtime, {"lookup": lookup}).execute(Task("t", "task"), BASE)
+        self.assertEqual(invoked, [])
+
+    def test_worker_requires_strict_final_content_without_legacy_actions(self):
+        for final in ("raw answer", {"content": "answer", "action": "final"}, {"content": ""}):
+            runtime = FakeNativeRuntime(final)
+            with self.assertRaises(ProtocolError):
+                ModelWorker(runtime).execute(Task("t", "task"), BASE)
+            self.assertEqual(len(runtime.calls), 1)
+
+    def test_worker_reserved_tool_names_cannot_be_replaced(self):
+        for name in ("read_harness", "list_harness", "", " "):
+            with self.assertRaises(ValueError):
+                ModelWorker(FakeNativeRuntime(), {name: lambda: None})
 
 
 if __name__ == "__main__":

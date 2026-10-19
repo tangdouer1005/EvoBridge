@@ -16,7 +16,8 @@ results are outside the scope of this release. See the
 
 ## Quick start
 
-Python 3.10 or newer; no third-party runtime dependencies.
+Python 3.10 or newer. Model-backed runs also require the Codex CLI on `PATH`
+(tested with version 0.162.1). The synthetic demo and unit tests run without it.
 
 ```bash
 python3 -m venv .venv
@@ -66,8 +67,9 @@ programs on the host.
 
 ## Model-backed offline evolution
 
-The HTTP adapter connects to a configured OpenAI-compatible Chat Completions
-endpoint using environment-based credentials.
+Configure Responses-compatible local and cloud endpoints with environment-based
+credentials. The execution runtime handles model turns, tool calls, and context
+compaction; EvoBridge supplies the role instructions and authorized tools.
 
 ```bash
 evobridge init --directory runtime/initial-harness
@@ -98,10 +100,11 @@ with `medium` reasoning. Endpoint model names must resolve to the intended
 deployment. BF16 weights, cache precision, and checkpoint identity must be
 established on the serving side; client configuration cannot verify them.
 
-The built-in clients use a strict JSON agent protocol. Local tools read private
-resources, edit only candidate harness paths, and invoke only registered checks.
-The cloud has no local tools and receives only guarded transcript text. Failed or
-malformed model calls are recorded without automatic retries or fallback edits.
+Local tools read private resources, edit only candidate harness paths, and invoke
+registered checks. The cloud receives guarded transcript text with no local tool
+access. Completed role decisions use structured outputs; failed or unfinished
+turns do not publish candidate edits. Provider requests and runtime sessions are
+recorded separately.
 See [integration and runtime details](docs/integration.md) for tool contracts,
 token accounting, context handling, and interruption behavior.
 
@@ -115,17 +118,20 @@ local environment adapter, not the cloud role.
 ```python
 from evobridge import Engine, PolicyGuard, Runner, SnapshotStore, Task
 from evobridge.agents import ModelLocalImprover, ModelCloudImprover, ModelWorker
+from evobridge.runtime import CodexRuntime
 
-# local_client, cloud_client, initial_harness, checks, and run_config are
-# caller-owned; use the same local model/settings for Worker and Improver.
+# Configure endpoints, the initial harness, checks, and authorized task tools.
+local_runtime = CodexRuntime(local_url, run_config.local)
+cloud_runtime = CodexRuntime(cloud_url, run_config.cloud,
+                             api_key_env="EVOBRIDGE_CLOUD_API_KEY")
 engine = Engine(
     SnapshotStore("runtime/my-application"),
-    ModelLocalImprover(local_client, checks),
-    ModelCloudImprover(cloud_client),
+    ModelLocalImprover(local_runtime, checks),
+    ModelCloudImprover(cloud_runtime),
     PolicyGuard(prohibited_patterns),
     checks, run_config, initial=initial_harness,
 )
-worker = ModelWorker(local_client, tools=authorized_task_tools)
+worker = ModelWorker(local_runtime, tools=authorized_task_tools)
 results = Runner(engine, worker).online([Task("task-001", "Your task instruction")])
 ```
 
@@ -167,13 +173,20 @@ keep private run records outside the source release.
 | --- | --- |
 | `src/evobridge/engine.py` | Algorithm 1 and guarded two-loop interaction |
 | `src/evobridge/harness.py`, `storage.py` | M/O/π artifacts, snapshots, durable records |
-| `src/evobridge/agents.py`, `providers.py` | Model-backed roles and HTTP transport |
+| `src/evobridge/agents.py` | Role instructions and authorized application tools |
+| `src/evobridge/runtime.py`, `responses.py` | Native sessions, provider forwarding, and usage records |
 | `src/evobridge/schedules.py` | Online, offline, frozen, and transfer schedules |
 | `configs/` | Explicit paper profiles and an example sharing policy |
 | `tests/` | Local contract, isolation, concurrency, and mock-provider tests |
 | `docs/` | Paper mapping and integration details |
 
-The test suite runs locally with deterministic fixtures and mocked model transports.
+The test suite runs locally with deterministic fixtures and simulated runtime
+transports. An optional installed-runtime integration check uses only a local
+synthetic model server:
+
+```bash
+EVOBRIDGE_TEST_NATIVE=1 python -m unittest discover -s tests -p test_native_integration.py -v
+```
 
 ## Source archive
 

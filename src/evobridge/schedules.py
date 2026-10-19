@@ -34,7 +34,9 @@ class Runner:
         store = self.engine.store
         store.save_record("schedule", "mode", {"mode": "online"})
         initial_record = store.read_record("schedule", "online")
-        spec = {"tasks": [asdict(t) for t in tasks], "evolve": evolve, "reset_every": reset_every}
+        spec = {"tasks": [asdict(t) for t in tasks], "evolve": evolve, "reset_every": reset_every,
+                "worker_runtime": getattr(getattr(self.worker, "client", None), "runtime_identity",
+                                          type(self.worker).__module__ + "." + type(self.worker).__qualname__)}
         if initial_record:
             if initial_record["spec"] != spec:
                 raise ValueError("Online schedule differs from the frozen task order")
@@ -136,6 +138,8 @@ def evaluate_frozen(worker: Worker, tasks: Iterable[Task], harness: Harness,
         settings = getattr(getattr(worker, "client", None), "settings", None)
         store.save_record("evaluations", evaluation_id, {
             "harness": harness.id, "tasks": [asdict(t) for t in tasks], "model": worker.model_id,
+            "runtime": getattr(getattr(worker, "client", None), "runtime_identity",
+                               type(worker).__module__ + "." + type(worker).__qualname__),
             "inference_settings": asdict(settings) if is_dataclass(settings) else settings})
     results = []
     for task in tasks:

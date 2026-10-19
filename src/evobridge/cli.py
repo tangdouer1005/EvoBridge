@@ -43,6 +43,7 @@ def main(argv=None):
     run.add_argument("--cloud-base-url", default=os.getenv("EVOBRIDGE_CLOUD_BASE_URL"))
     run.add_argument("--local-key-env", default="EVOBRIDGE_LOCAL_API_KEY")
     run.add_argument("--cloud-key-env", default="EVOBRIDGE_CLOUD_API_KEY")
+    run.add_argument("--runtime-executable", default="codex", help="Agent runtime executable")
     run.add_argument("--checks", help="Trusted module:factory returning CheckSuite")
     args = parser.parse_args(argv)
     try:
@@ -55,7 +56,7 @@ def main(argv=None):
             print("Initial memory.md and CONTEXT.md written.")
         elif args.command == "offline":
             from .agents import ModelCloudImprover, ModelLocalImprover
-            from .providers import HTTPChatClient
+            from .runtime import CodexRuntime
             if not args.cloud_base_url:
                 raise ValueError("Set --cloud-base-url or EVOBRIDGE_CLOUD_BASE_URL")
             config = RunConfig.from_dict(load_json(args.config))
@@ -73,10 +74,14 @@ def main(argv=None):
                 checks = getattr(importlib.import_module(module), factory)()
                 if not isinstance(checks, CheckSuite):
                     raise ValueError("Checks factory must return CheckSuite")
-            local = HTTPChatClient(args.local_base_url, config.local,
-                                   api_key_env=args.local_key_env if os.getenv(args.local_key_env) else None)
-            cloud = HTTPChatClient(args.cloud_base_url, config.cloud, api_key_env=args.cloud_key_env)
             store = SnapshotStore(args.workdir)
+            local = CodexRuntime(args.local_base_url, config.local,
+                                 api_key_env=args.local_key_env if os.getenv(args.local_key_env) else None,
+                                 executable=args.runtime_executable,
+                                 logdir=store.root / "private" / "local")
+            cloud = CodexRuntime(args.cloud_base_url, config.cloud, api_key_env=args.cloud_key_env,
+                                 executable=args.runtime_executable,
+                                 logdir=store.root / "private" / "cloud")
             engine = Engine(store, ModelLocalImprover(local, checks=checks), ModelCloudImprover(cloud),
                             guard, checks, config, initial=Harness.from_directory(args.harness),
                             resources=load_json(args.resources) if args.resources else {})
@@ -87,6 +92,8 @@ def main(argv=None):
                     for receipt in client.usage_receipts:
                         data = asdict(receipt)
                         store.save_event("provider_usage", {"role": role, **data})
+                    for receipt in client.session_receipts:
+                        store.save_event("runtime_session", {"role": role, **asdict(receipt)})
             rounds = store.history("rounds")
             failed = sum(row["result"]["status"] == "failed" for row in rounds)
             print(json.dumps({"checkpoints": {str(e): h.id for e, h in snapshots.items()},

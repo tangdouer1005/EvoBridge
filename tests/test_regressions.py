@@ -55,6 +55,18 @@ class RuntimeRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "inference settings"):
                 Engine(store, local, DemoCloud(), PolicyGuard([]))
 
+    def test_frozen_evaluation_refuses_changed_runtime_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SnapshotStore(Path(directory).resolve())
+            harness = Harness({"memory.md": "", "CONTEXT.md": "policy"})
+            worker = DemoWorker()
+            worker.client = SimpleNamespace(settings=ModelSettings.local(), runtime_identity="backend-one")
+            tasks = [Task("same", "Task")]
+            evaluate_frozen(worker, tasks, harness, store=store)
+            worker.client.runtime_identity = "backend-two"
+            with self.assertRaises(ValueError):
+                evaluate_frozen(worker, tasks, harness, store=store)
+
     def test_worker_sampling_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Engine(SnapshotStore(Path(directory).resolve()), DemoLocal(), DemoCloud(), PolicyGuard([]))

@@ -104,7 +104,7 @@ require at least one registered behavioral check; the application is responsible
 for covering the affected operations.
 
 Prompts, check interfaces, context compaction, and interruption handling are
-specified in the [integration guide](integration.md). The configurable per-phase
-tool-step limit is separate from the paper's interaction budgets. Framework tests
-and synthetic examples validate these implementation contracts; benchmark
-experiments are outside this source release.
+specified in the [integration guide](integration.md). The execution runtime
+handles internal tool calls and compaction, while EvoBridge enforces the two
+collaboration budgets. Framework tests and synthetic examples validate these
+implementation contracts; benchmark experiments are outside this source release.

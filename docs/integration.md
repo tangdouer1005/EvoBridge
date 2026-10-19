@@ -68,50 +68,68 @@ Cloud actions have a strict JSON envelope:
 
 Inquiry supports `ASK`, `PROPOSE`, `RETAIN`; implementation responses support
 `RESPOND`, `PROPOSE`, `ASK`, `WITHDRAW`. The cloud has no file or environment tool
-registry. Private binding and execution stay local. See `agents.py` for the local
-tool/final envelopes. Invalid JSON or unavailable actions stop that round without
-publishing partial files; there is no model-output repair/retry loop.
+registry. Private binding and execution stay local. Tools are registered with
+native schemas and host callbacks; `agents.py` parses only the completed role
+outputs. Malformed final JSON stops the round without publishing partial files.
 
-## Model serving and token accounting
+## Execution and model serving
 
-The built-in transport uses `/chat/completions`, JSON request/response bodies,
-and an environment-variable bearer credential when configured. The server must
-support the requested parameters. Local sampling includes `top_k`, `min_p`,
-`repetition_penalty`, and `chat_template_kwargs.enable_thinking=false`. Cloud
-requests include `reasoning_effort=medium`. Unsupported server fields cause a
-failure rather than silent removal. No model-name or endpoint substitution is
-performed. Model aliases and BF16 deployment remain the operator's responsibility.
+Model-backed roles use the installed agent runtime through its stdio app-server
+interface. The tested dependency is Codex CLI 0.162.1; `--runtime-executable` can
+select its executable. The [runtime protocol documentation](https://developers.openai.com/codex/app-server)
+provides the upstream API reference. If the executable is missing or its protocol
+is incompatible, execution stops; there is no fallback agent loop.
 
-The paper's local limits are 131,072 runtime-context tokens, compaction at 98,304,
-32,768 maximum output tokens, and 8,192 per tool output. A caller can inject the
-deployed model's token counter into `HTTPChatClient`. Without one, the framework
-uses UTF-8 byte length plus framing overhead as a conservative estimate, not an
-exact tokenizer. Server-reported usage remains separate from estimates.
+Each role phase starts an isolated ephemeral session. The runtime owns model
+turns, native tool dispatch, and automatic compaction. EvoBridge registers only
+the phase's permitted dynamic tools. Shell, browser, plugin, memory, and other
+host integrations are disabled. Unknown capabilities and approval requests are
+rejected. The cloud session has no tools, and receives only the guarded
+transcript. Local investigation and realization receive explicit private
+resources through scoped tools. User-level configuration and login files are
+not inherited by these sessions.
 
-Compaction removes older conversational tool exchanges with an explicit omission
-notice, retaining essential task and phase data without generating summaries. If required context cannot fit alongside the output reservation,
-the request fails before sending. This compaction policy is an implementation
-choice: the paper specifies the threshold, not the algorithm. Full guarded cloud
-transcripts must fit; they are not truncated to make a new request.
+The configured endpoints must support the Responses API, including native
+function-call items and streaming responses. An authenticated loopback proxy
+forwards these requests, enforcing the configured model and permitted tools.
+It supplies provider credentials from the named environment variable and keeps
+the upstream credential out of the runtime subprocess. It does not convert Chat
+Completions responses or rewrite generated model/tool output.
 
-The built-in agent tool loop has a configurable default cap of 64 tool actions
-per phase. This is a separate engineering limit from `BI`/`BR`, not an additional
-paper hyperparameter. All phases use the same local model settings. Configure
-these tool limits on custom agents as needed; existing task tools/permissions
-must stay fixed for a comparison.
+Regular `/responses` requests use the model profile's sampling and output limit.
+Local requests explicitly set `reasoning.effort=none`; cloud requests set
+`reasoning.effort=medium`. Local sampling includes `temperature`, `top_p`,
+`top_k`, `min_p`, `presence_penalty`, and `repetition_penalty`; the local serving
+endpoint must support these parameters. Requests to `/responses/compact`, when
+used by the runtime, preserve that endpoint's narrower schema and fix the model.
+Server configuration establishes the checkpoint and numeric precision.
 
-Usage receipts distinguish attempted transport calls from local preflight
-failures. Missing token counts are `None`, never zero. Cached-input and reasoning
-output counts, when supplied by the server, are subsets of the reported input
-and output totals and must not be added again. There are no automatic request
-retries. Failed requests may incur provider charges. The offline CLI saves usage
-receipts to the private store when the invocation exits normally or raises a
-caught exception; abrupt process termination can leave usage unavailable.
+The local context window is 131,072 tokens, compaction begins at 98,304, maximum
+output is 32,768 tokens, and tool output is limited to 8,192 tokens. These values
+are supplied to the runtime or provider as appropriate. Application pagination
+also uses a conservative UTF-8 byte estimate to bound tool envelopes; it is
+separate from native tokenization, compaction, and provider-reported usage.
+The `BI`/`BR` budgets bound collaboration exchanges, not the native execution
+loop's internal tool calls.
+
+Only connection establishment and initial session admission are time-bounded.
+Accepted generation has no additional wall-clock deadline. Request and stream
+retries are disabled; a failed turn is not silently replayed. Interrupted or
+incomplete generations cannot be accepted as completed role outputs.
+
+Provider receipts count individual upstream requests and preserve missing usage
+as `None`. Cached-input and reasoning-output counts are subsets of the reported
+input and output totals. Native session receipts separately report turn status,
+compaction events, and runtime token totals; session totals must not be added to
+provider totals or treated as provider request counts. Failed requests may incur
+charges. The offline CLI writes both kinds of records to the private store;
+abrupt process termination can leave accounting incomplete.
 
 ## Resume and failure semantics
 
 Use a fresh private work directory per independent run. Initialization freezes
-the run configuration, policy, initial harness, resources, and named check set.
+the run configuration, runtime backend/endpoint, policy, initial harness,
+resources, and named check set.
 The application must also freeze actual tool/check implementations and serving
 configuration; their names alone cannot attest to remote behavior.
 

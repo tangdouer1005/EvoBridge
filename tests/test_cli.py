@@ -1,5 +1,5 @@
 from contextlib import redirect_stdout, redirect_stderr
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import io
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from evobridge import Harness, RunConfig, SnapshotStore
 from evobridge.cli import main
-from evobridge.providers import HTTPChatClient
+
 
 
 class CLIIntegrationTests(unittest.TestCase):
@@ -25,31 +25,46 @@ class CLIIntegrationTests(unittest.TestCase):
             corpus = root / "corpus.jsonl"
             corpus.write_text(json.dumps({"id": "one", "task": "Private task", "outcome": False,
                                           "observations": ["PRIVATE_SENTINEL"], "feedback": "Original"}) + "\n")
-            replies = {
-                "local": iter([
-                    {"action": "final", "content": "PRIVATE_SENTINEL in proposed brief"},
-                    {"action": "tool", "name": "write", "arguments": {"path": "memory.md", "content": "Scoped fact"}},
-                    {"action": "final", "status": "READY", "reviewed": True,
-                     "review": "Checked applicability, consistency, and policy links."}]),
-                "cloud": iter([{"action": "PROPOSE", "content": "Update memory with an applicable locally verified fact."}])}
             requests = []
 
-            def factory(base_url, settings, **kwargs):
-                role = "local" if "local" in base_url else "cloud"
-                def transport(request, timeout):
-                    payload = json.loads(request.data)
-                    requests.append((role, payload))
-                    return {"id": str(len(requests)), "choices": [{"finish_reason": "stop", "message": {
-                        "content": json.dumps(next(replies[role]))}}],
-                        "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}}
-                return HTTPChatClient(base_url, settings, transport=transport)
+            @dataclass
+            class FakeUsage:
+                input_tokens: int = 100
+                output_tokens: int = 10
+                attempted: bool = True
+
+            @dataclass
+            class FakeSession:
+                status: str = "completed"
+
+            class FakeRuntime:
+                def __init__(self, base_url, settings, **kwargs):
+                    self.settings = settings
+                    self.role = "local" if "local" in base_url else "cloud"
+                    self.runtime_identity = {"backend": "test-native", "endpoint": base_url}
+                    self.usage_receipts = []
+                    self.session_receipts = []
+
+                def run(self, instructions, prompt, tools, dispatch):
+                    requests.append((self.role, {"instructions": instructions, "prompt": prompt,
+                                                 "tools": tools}))
+                    self.usage_receipts.append(FakeUsage())
+                    self.session_receipts.append(FakeSession())
+                    if self.role == "cloud":
+                        assert tools == []
+                        return json.dumps({"action": "PROPOSE", "content": "Update locally verified domain memory."})
+                    if "PREPARATION" in instructions:
+                        return json.dumps({"content": "PRIVATE_SENTINEL in proposed brief"})
+                    dispatch("write", {"path": "memory.md", "content": "Scoped fact"})
+                    return json.dumps({"status": "READY", "reviewed": True,
+                                       "review": "Checked applicability, consistency and links."})
 
             args = ["offline", "--workdir", str(root / "run"), "--config", str(config),
                     "--policy", str(policy), "--harness", str(harness), "--corpus", str(corpus),
                     "--epochs", "1", "--local-base-url", "http://local/v1",
                     "--cloud-base-url", "http://cloud/v1"]
             output = io.StringIO()
-            with patch("evobridge.providers.HTTPChatClient", factory), redirect_stdout(output):
+            with patch("evobridge.runtime.CodexRuntime", FakeRuntime), redirect_stdout(output):
                 self.assertEqual(main(args), 0)
             store = SnapshotStore(root / "run")
             self.assertEqual(store.current().files["memory.md"], "Scoped fact")
@@ -60,14 +75,14 @@ class CLIIntegrationTests(unittest.TestCase):
             self.assertIn("BLOCKED", cloud_payload)
             events = [json.loads(line) for line in (root / "run" / "events.jsonl").read_text().splitlines()]
             usage = [event["data"] for event in events if event["kind"] == "provider_usage"]
-            self.assertEqual(len(usage), 4)
-            self.assertEqual(sum(u["prompt_tokens"] for u in usage), 400)
+            self.assertEqual(len(usage), 3)
+            self.assertEqual(sum(u["input_tokens"] for u in usage), 300)
             self.assertTrue(all(u["attempted"] for u in usage))
             self.assertEqual({u["role"] for u in usage}, {"local", "cloud"})
             # Reopening a completed corpus does not call either model again.
-            with patch("evobridge.providers.HTTPChatClient", factory), redirect_stdout(io.StringIO()):
+            with patch("evobridge.runtime.CodexRuntime", FakeRuntime), redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)
-            self.assertEqual(len(requests), 4)
+            self.assertEqual(len(requests), 3)
 
     def test_init_does_not_overwrite_an_existing_harness(self):
         with tempfile.TemporaryDirectory() as directory:
